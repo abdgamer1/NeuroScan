@@ -3,3 +3,4 @@ tensorflow==2.8.0   # or latest TensorFlow compatible with Python 3.8/3.9
 pillow
 numpy
 gdown
+protobuf==3.20.3    # Downgrade protobuf to avoid version conflict with TensorFlow
