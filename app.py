@@ -8,12 +8,12 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # Define the model file name
-MODEL_PATH = 'model.h5'
+MODEL_PATH = 'ef.h5'  # Updated model file name
 
 # Check if the model already exists, if not, download it
 if not os.path.exists(MODEL_PATH):
     print("Model not found. Downloading...")
-    model_url = "https://drive.google.com/uc?id=1eKanoLsBZQ2c61Z5X0LW8_E6GBip8KGL"
+    model_url = "https://drive.google.com/uc?id=1eKanoLsBZQ2c61Z5X0LW8_E6GBip8KGL"  # Google Drive model URL
     gdown.download(model_url, MODEL_PATH, quiet=False)
     print("Model downloaded successfully.")
 else:
