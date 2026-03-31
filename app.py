@@ -22,7 +22,8 @@ else:
 # Load the model and handle potential errors
 try:
     print("Loading model...")
-    model = tf.keras.models.load_model(MODEL_PATH)
+    # Disable compilation to bypass 'batch_shape' error
+    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
     print("Model loaded successfully.")
 except Exception as e:
     print(f"Error loading model: {e}")
