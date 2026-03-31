@@ -12,14 +12,16 @@ MODEL_PATH = 'model.h5'
 
 # Check if the model already exists, if not, download it
 if not os.path.exists(MODEL_PATH):
-    model_url = "https://drive.google.com/uc?id=1eKanoLsBZQ2c61Z5X0LW8_E6GBip8KGL"
     print("Model not found. Downloading...")
+    model_url = "https://drive.google.com/uc?id=1eKanoLsBZQ2c61Z5X0LW8_E6GBip8KGL"
     gdown.download(model_url, MODEL_PATH, quiet=False)
+    print("Model downloaded successfully.")
 else:
     print("Model already exists, skipping download.")
 
-# Load the model
+# Load the model and handle potential errors
 try:
+    print("Loading model...")
     model = tf.keras.models.load_model(MODEL_PATH)
     print("Model loaded successfully.")
 except Exception as e:
@@ -29,7 +31,7 @@ except Exception as e:
 def predict(image):
     """Preprocess image and make prediction."""
     # Resize image to match the model's input size
-    image = image.resize((224, 224))  # You can adjust this if needed
+    image = image.resize((224, 224))  # Adjust if necessary based on your model's input size
     img_array = np.array(image) / 255.0  # Normalize the image
     img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension
 
@@ -51,7 +53,9 @@ def upload_image():
         return jsonify({"prediction": prediction})
 
     except Exception as e:
+        print(f"Error during prediction: {e}")
         return jsonify({"error": str(e)}), 400
 
 if __name__ == '__main__':
+    # Set debug=False when deploying to production
     app.run(debug=True)
