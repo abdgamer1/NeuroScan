@@ -3,7 +3,7 @@ import io
 import base64
 import tempfile
 import numpy as np
-from flask import Flask, request, jsonify, send_file, render_template_string
+from flask import Flask, request, jsonify, render_template_string
 
 import nibabel as nib
 from PIL import Image
@@ -23,15 +23,50 @@ CLASS_NAMES = ["glioma", "meningioma"]
 IMG_SIZE    = 224
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
-PTH_PATH       = os.path.join(BASE_DIR, "classification.pth")
-H5_PATH        = os.path.join(BASE_DIR, "finetuned_meningioma_model.h5")
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+PTH_PATH    = os.path.join(BASE_DIR, "classification.pth")
+H5_PATH     = os.path.join(BASE_DIR, "finetuned_meningioma_model.h5")
+
+
+# ─────────────────────────────────────────────
+# GLOBAL JSON ERROR HANDLERS
+# Ensures the frontend NEVER receives an HTML error page.
+# Without these, any unhandled exception returns Flask's default
+# HTML 500 page, which causes "Unexpected token '<'" in the browser.
+# ─────────────────────────────────────────────
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"error": str(e)}), 400
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Catch-all: any unhandled Python exception → JSON."""
+    import traceback
+    traceback.print_exc()
+    return jsonify({"error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────
 # LOAD MODELS
 # ─────────────────────────────────────────────
 def load_pytorch_model():
+    if not os.path.exists(PTH_PATH):
+        raise FileNotFoundError(
+            f"classification.pth not found at {PTH_PATH}\n"
+            f"Files in BASE_DIR: {os.listdir(BASE_DIR)}"
+        )
     model = timm.create_model("efficientnet_b0", pretrained=False, num_classes=2)
     state = torch.load(PTH_PATH, map_location=DEVICE)
     if isinstance(state, dict):
@@ -42,7 +77,21 @@ def load_pytorch_model():
     return model
 
 def load_keras_model():
+    if not os.path.exists(H5_PATH):
+        raise FileNotFoundError(
+            f"finetuned_meningioma_model.h5 not found at {H5_PATH}\n"
+            f"Files in BASE_DIR: {os.listdir(BASE_DIR)}"
+        )
     return tf.keras.models.load_model(H5_PATH)
+
+
+print("=" * 60)
+print(f"BASE_DIR       : {BASE_DIR}")
+print(f"PTH_PATH       : {PTH_PATH}  exists={os.path.exists(PTH_PATH)}")
+print(f"H5_PATH        : {H5_PATH}  exists={os.path.exists(H5_PATH)}")
+print(f"Files in dir   : {os.listdir(BASE_DIR)}")
+print(f"DEVICE         : {DEVICE}")
+print("=" * 60)
 
 print("Loading models...")
 try:
@@ -103,13 +152,12 @@ def mask_preview_base64(mask_vol: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def slice_preview_base64(vol: np.ndarray) -> str:
-    """Middle axial slice of any volume → base64 PNG (grayscale)."""
     norm = normalize_volume(vol)
-    sl = get_middle_slice(norm)
-    rgb = slice_to_rgb(sl)
-    img = Image.fromarray(rgb, mode="RGB")
-    img = img.resize((256, 256), Image.LANCZOS)
-    buf = io.BytesIO()
+    sl   = get_middle_slice(norm)
+    rgb  = slice_to_rgb(sl)
+    img  = Image.fromarray(rgb, mode="RGB")
+    img  = img.resize((256, 256), Image.LANCZOS)
+    buf  = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
@@ -125,15 +173,15 @@ clf_transform = transforms.Compose([
 ])
 
 def prepare_clf_input(flair: np.ndarray, t1ce: np.ndarray) -> torch.Tensor:
-    flair_n = normalize_volume(flair)
-    t1ce_n  = normalize_volume(t1ce)
+    flair_n  = normalize_volume(flair)
+    t1ce_n   = normalize_volume(t1ce)
     flair_sl = get_middle_slice(flair_n)
     t1ce_sl  = get_middle_slice(t1ce_n)
     avg_sl   = (flair_sl + t1ce_sl) / 2.0
-    rgb = np.stack([flair_sl, t1ce_sl, avg_sl], axis=-1)
-    rgb = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-    pil_img = Image.fromarray(rgb, mode="RGB")
-    tensor  = clf_transform(pil_img).unsqueeze(0).to(DEVICE)
+    rgb      = np.stack([flair_sl, t1ce_sl, avg_sl], axis=-1)
+    rgb      = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+    pil_img  = Image.fromarray(rgb, mode="RGB")
+    tensor   = clf_transform(pil_img).unsqueeze(0).to(DEVICE)
     return tensor
 
 def prepare_seg_input(flair: np.ndarray, t1ce: np.ndarray,
@@ -142,8 +190,8 @@ def prepare_seg_input(flair: np.ndarray, t1ce: np.ndarray,
     def resize_vol(vol, target):
         factors = [t / s for t, s in zip(target, vol.shape)]
         return zoom(vol, factors, order=1)
-    flair_r = resize_vol(normalize_volume(flair), target_shape)
-    t1ce_r  = resize_vol(normalize_volume(t1ce),  target_shape)
+    flair_r  = resize_vol(normalize_volume(flair), target_shape)
+    t1ce_r   = resize_vol(normalize_volume(t1ce),  target_shape)
     combined = np.stack([flair_r, t1ce_r], axis=-1)
     return combined[np.newaxis, ...]
 
@@ -167,19 +215,19 @@ def run_classification(flair: np.ndarray, t1ce: np.ndarray) -> dict:
     }
 
 def run_segmentation(flair: np.ndarray, t1ce: np.ndarray) -> dict:
-    inp        = prepare_seg_input(flair, t1ce)
-    pred       = seg_model.predict(inp, verbose=0)
-    mask_vol   = (pred[0, ..., 0] > 0.5).astype(np.float32)
+    inp         = prepare_seg_input(flair, t1ce)
+    pred        = seg_model.predict(inp, verbose=0)
+    mask_vol    = (pred[0, ..., 0] > 0.5).astype(np.float32)
     voxel_count = int(mask_vol.sum())
     total_vox   = int(mask_vol.size)
     nii_bytes   = volume_to_nifti_bytes(mask_vol)
     nii_b64     = base64.b64encode(nii_bytes).decode("utf-8")
     preview_b64 = mask_preview_base64(mask_vol)
     return {
-        "tumor_voxel_count":  voxel_count,
-        "total_voxels":       total_vox,
-        "tumor_volume_pct":   round(100.0 * voxel_count / total_vox, 4),
-        "mask_nifti_b64":     nii_b64,
+        "tumor_voxel_count":    voxel_count,
+        "total_voxels":         total_vox,
+        "tumor_volume_pct":     round(100.0 * voxel_count / total_vox, 4),
+        "mask_nifti_b64":       nii_b64,
         "mask_preview_png_b64": preview_b64,
     }
 
@@ -226,7 +274,6 @@ UI_HTML = """<!DOCTYPE html>
 
   .container { max-width: 880px; margin: 0 auto; }
 
-  /* ── Header ── */
   .header { text-align: center; margin-bottom: 2.5rem; }
   .header h1 {
     font-size: 1.75rem;
@@ -240,7 +287,6 @@ UI_HTML = """<!DOCTYPE html>
   }
   .header p { color: var(--muted); font-size: 0.9rem; }
 
-  /* ── Status pills ── */
   .model-status {
     display: flex;
     gap: 10px;
@@ -262,7 +308,6 @@ UI_HTML = """<!DOCTYPE html>
   .pill.err { border-color: rgba(248,113,113,0.4); background: rgba(248,113,113,0.08); color: var(--danger); }
   .pill-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
-  /* ── Card ── */
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -279,7 +324,6 @@ UI_HTML = """<!DOCTYPE html>
     margin-bottom: 1rem;
   }
 
-  /* ── Upload grid ── */
   .upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
   @media (max-width: 540px) { .upload-grid { grid-template-columns: 1fr; } }
 
@@ -302,13 +346,7 @@ UI_HTML = """<!DOCTYPE html>
   .upload-hint  { font-size: 0.75rem; color: var(--muted); }
   .upload-name  { font-size: 0.78rem; color: var(--success); margin-top: 0.4rem; font-weight: 500; }
 
-  /* ── Mode selector ── */
-  .mode-row {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 1rem;
-    flex-wrap: wrap;
-  }
+  .mode-row { display: flex; gap: 8px; margin-bottom: 1rem; flex-wrap: wrap; }
   .mode-btn {
     padding: 6px 16px;
     border-radius: 999px;
@@ -320,13 +358,8 @@ UI_HTML = """<!DOCTYPE html>
     cursor: pointer;
     transition: all 0.15s;
   }
-  .mode-btn.active {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
+  .mode-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
-  /* ── Submit button ── */
   .btn-run {
     width: 100%;
     padding: 0.85rem;
@@ -347,7 +380,6 @@ UI_HTML = """<!DOCTYPE html>
   .btn-run:active { transform: scale(0.99); }
   .btn-run:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  /* ── Spinner ── */
   .spinner {
     width: 18px; height: 18px;
     border: 2px solid rgba(255,255,255,0.3);
@@ -358,13 +390,11 @@ UI_HTML = """<!DOCTYPE html>
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  /* ── Results ── */
   #results { display: none; }
 
   .result-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
   @media (max-width: 580px) { .result-grid { grid-template-columns: 1fr; } }
 
-  /* Classification result */
   .clf-result {
     background: var(--surface2);
     border-radius: var(--radius-sm);
@@ -380,12 +410,8 @@ UI_HTML = """<!DOCTYPE html>
     color: var(--muted);
     margin-bottom: 0.2rem;
   }
-  .predicted-class {
-    font-size: 1.5rem;
-    font-weight: 700;
-    text-transform: capitalize;
-  }
-  .predicted-class.glioma    { color: var(--glioma-color); }
+  .predicted-class { font-size: 1.5rem; font-weight: 700; text-transform: capitalize; }
+  .predicted-class.glioma     { color: var(--glioma-color); }
   .predicted-class.meningioma { color: var(--menin-color); }
 
   .confidence-bar-wrap { margin-top: 0.2rem; }
@@ -396,39 +422,16 @@ UI_HTML = """<!DOCTYPE html>
     color: var(--muted);
     margin-bottom: 4px;
   }
-  .bar-track {
-    height: 6px;
-    background: var(--border);
-    border-radius: 999px;
-    overflow: hidden;
-  }
-  .bar-fill {
-    height: 100%;
-    border-radius: 999px;
-    background: var(--accent);
-    transition: width 0.6s ease;
-  }
+  .bar-track { height: 6px; background: var(--border); border-radius: 999px; overflow: hidden; }
+  .bar-fill  { height: 100%; border-radius: 999px; background: var(--accent); transition: width 0.6s ease; }
 
-  .prob-row {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
+  .prob-row  { display: flex; flex-direction: column; gap: 8px; }
   .prob-item { display: flex; flex-direction: column; gap: 4px; }
-  .prob-item-label {
-    display: flex;
-    justify-content: space-between;
-    font-size: 0.78rem;
-  }
+  .prob-item-label { display: flex; justify-content: space-between; font-size: 0.78rem; }
   .prob-item-label span:first-child { color: var(--muted); text-transform: capitalize; }
   .prob-item-label span:last-child  { font-weight: 600; }
 
-  /* Segmentation result */
-  .seg-result {
-    background: var(--surface2);
-    border-radius: var(--radius-sm);
-    padding: 1.2rem;
-  }
+  .seg-result { background: var(--surface2); border-radius: var(--radius-sm); padding: 1.2rem; }
   .seg-preview {
     width: 100%;
     border-radius: 6px;
@@ -437,17 +440,8 @@ UI_HTML = """<!DOCTYPE html>
     image-rendering: pixelated;
     display: block;
   }
-  .seg-stats {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .stat-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 0.82rem;
-  }
+  .seg-stats { display: flex; flex-direction: column; gap: 8px; }
+  .stat-row  { display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; }
   .stat-row span:first-child { color: var(--muted); }
   .stat-row span:last-child  { font-weight: 600; }
 
@@ -465,7 +459,6 @@ UI_HTML = """<!DOCTYPE html>
   }
   .download-btn:hover { background: var(--surface); }
 
-  /* ── Error box ── */
   .error-box {
     background: rgba(248,113,113,0.08);
     border: 1px solid rgba(248,113,113,0.25);
@@ -474,9 +467,10 @@ UI_HTML = """<!DOCTYPE html>
     color: var(--danger);
     font-size: 0.85rem;
     display: none;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
-  /* ── Section divider ── */
   .section-label {
     font-size: 0.68rem;
     font-weight: 600;
@@ -488,32 +482,12 @@ UI_HTML = """<!DOCTYPE html>
     align-items: center;
     gap: 8px;
   }
-  .section-label::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: var(--border);
-  }
+  .section-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
 
-  /* ── Input slice previews ── */
-  .slice-preview-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-    margin-top: 0.75rem;
-  }
+  .slice-preview-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 0.75rem; }
   .slice-preview-item { text-align: center; }
-  .slice-preview-item img {
-    width: 100%;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    display: block;
-  }
-  .slice-preview-item p {
-    font-size: 0.72rem;
-    color: var(--muted);
-    margin-top: 4px;
-  }
+  .slice-preview-item img { width: 100%; border-radius: 6px; border: 1px solid var(--border); display: block; }
+  .slice-preview-item p  { font-size: 0.72rem; color: var(--muted); margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -524,7 +498,6 @@ UI_HTML = """<!DOCTYPE html>
     <p>Upload NIfTI MRI volumes for AI-powered classification and segmentation</p>
   </div>
 
-  <!-- Model status pills -->
   <div class="model-status">
     <div class="pill {{ 'ok' if clf_ready else 'err' }}">
       <span class="pill-dot"></span>
@@ -536,11 +509,9 @@ UI_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Upload card -->
   <div class="card">
     <div class="card-title">Input volumes</div>
     <div class="upload-grid">
-      <!-- FLAIR -->
       <div class="upload-zone" id="flair-zone">
         <input type="file" id="flair-input" accept=".nii,.nii.gz" onchange="onFileChange('flair')"/>
         <div class="upload-icon">🧠</div>
@@ -548,7 +519,6 @@ UI_HTML = """<!DOCTYPE html>
         <div class="upload-hint">.nii or .nii.gz</div>
         <div class="upload-name" id="flair-name"></div>
       </div>
-      <!-- T1CE -->
       <div class="upload-zone" id="t1ce-zone">
         <input type="file" id="t1ce-input" accept=".nii,.nii.gz" onchange="onFileChange('t1ce')"/>
         <div class="upload-icon">💡</div>
@@ -559,7 +529,6 @@ UI_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Analysis mode card -->
   <div class="card">
     <div class="card-title">Analysis mode</div>
     <div class="mode-row">
@@ -573,14 +542,10 @@ UI_HTML = """<!DOCTYPE html>
     </button>
   </div>
 
-  <!-- Error -->
   <div class="error-box" id="error-box"></div>
 
-  <!-- Results -->
   <div id="results">
     <div class="section-label">Results</div>
-
-    <!-- Input slice previews -->
     <div id="input-previews" style="display:none;" class="card">
       <div class="card-title">Input slices (axial middle)</div>
       <div class="slice-preview-grid">
@@ -594,14 +559,13 @@ UI_HTML = """<!DOCTYPE html>
         </div>
       </div>
     </div>
-
     <div class="result-grid" id="result-grid"></div>
   </div>
 
 </div>
 
 <script>
-  let currentMode = 'both';
+  let currentMode  = 'both';
   let maskNiftiB64 = null;
 
   function setMode(mode) {
@@ -635,14 +599,14 @@ UI_HTML = """<!DOCTYPE html>
     const btn     = document.getElementById('run-btn');
     const spinner = document.getElementById('spinner');
     const label   = document.getElementById('run-label');
-    btn.disabled       = loading;
+    btn.disabled          = loading;
     spinner.style.display = loading ? 'block' : 'none';
-    label.textContent  = loading ? 'Analysing…' : 'Analyse';
+    label.textContent     = loading ? 'Analysing…' : 'Analyse';
   }
 
   function showError(msg) {
     const box = document.getElementById('error-box');
-    box.textContent = msg;
+    box.textContent   = msg;
     box.style.display = 'block';
   }
   function hideError() {
@@ -652,8 +616,8 @@ UI_HTML = """<!DOCTYPE html>
   function pct(v) { return (v * 100).toFixed(1) + '%'; }
 
   function buildClassificationCard(data) {
-    const cls = data.predicted_class;
-    const conf = data.confidence;
+    const cls   = data.predicted_class;
+    const conf  = data.confidence;
     const probs = data.probabilities;
     return `
       <div class="clf-result">
@@ -717,7 +681,7 @@ UI_HTML = """<!DOCTYPE html>
   function downloadMask() {
     if (!maskNiftiB64) return;
     const bytes = atob(maskNiftiB64);
-    const arr = new Uint8Array(bytes.length);
+    const arr   = new Uint8Array(bytes.length);
     for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
     const blob = new Blob([arr], { type: 'application/octet-stream' });
     const url  = URL.createObjectURL(blob);
@@ -748,6 +712,16 @@ UI_HTML = """<!DOCTYPE html>
 
     try {
       const resp = await fetch(endpointMap[currentMode], { method: 'POST', body: fd });
+
+      // Guard: if response is not JSON (server returned HTML), show a clear message
+      const contentType = resp.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        const text = await resp.text();
+        showError('Server returned a non-JSON response (HTTP ' + resp.status + ').\\n\\nFirst 400 chars:\\n' + text.slice(0, 400));
+        setLoading(false);
+        return;
+      }
+
       const data = await resp.json();
 
       if (!resp.ok) {
@@ -756,7 +730,6 @@ UI_HTML = """<!DOCTYPE html>
         return;
       }
 
-      // Build result cards
       const grid = document.getElementById('result-grid');
       let html = '';
 
@@ -809,9 +782,13 @@ def index():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status":              "ok",
+        "status":               "ok",
         "classification_ready": clf_model is not None,
         "segmentation_ready":   seg_model is not None,
+        "clf_path_exists":      os.path.exists(PTH_PATH),
+        "seg_path_exists":      os.path.exists(H5_PATH),
+        "base_dir":             BASE_DIR,
+        "files_in_dir":         os.listdir(BASE_DIR),
     })
 
 
@@ -838,7 +815,7 @@ def predict_both():
         except Exception as e:
             result["classification"] = {"error": str(e)}
     else:
-        result["classification"] = {"error": "Classification model not loaded"}
+        result["classification"] = {"error": "Classification model not loaded — check Render logs for details"}
 
     if seg_model:
         try:
@@ -846,7 +823,7 @@ def predict_both():
         except Exception as e:
             result["segmentation"] = {"error": str(e)}
     else:
-        result["segmentation"] = {"error": "Segmentation model not loaded"}
+        result["segmentation"] = {"error": "Segmentation model not loaded — check Render logs for details"}
 
     return jsonify(result)
 
@@ -854,7 +831,7 @@ def predict_both():
 @app.route("/predict/classify", methods=["POST"])
 def predict_classify():
     if not clf_model:
-        return jsonify({"error": "Classification model not loaded"}), 503
+        return jsonify({"error": "Classification model not loaded — check Render logs for details"}), 503
     try:
         flair, t1ce = get_nifti_inputs()
         return jsonify(run_classification(flair, t1ce))
@@ -867,7 +844,7 @@ def predict_classify():
 @app.route("/predict/segment", methods=["POST"])
 def predict_segment():
     if not seg_model:
-        return jsonify({"error": "Segmentation model not loaded"}), 503
+        return jsonify({"error": "Segmentation model not loaded — check Render logs for details"}), 503
     try:
         flair, t1ce = get_nifti_inputs()
         return jsonify(run_segmentation(flair, t1ce))
