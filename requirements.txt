@@ -1,6 +1,23 @@
-flask
-tensorflow==2.8.0   # or latest TensorFlow compatible with Python 3.8/3.9
-pillow
-numpy
-gdown
-protobuf==3.20.3    # Downgrade protobuf to avoid version conflict with TensorFlow
+# ─── Web Framework ───────────────────────────
+flask>=2.3.0
+gunicorn>=21.2.0          # Render uses gunicorn to serve Flask
+
+# ─── Deep Learning ───────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+timm>=0.9.12              # EfficientNet backbone for classification.pth
+
+tensorflow-cpu>=2.15.0    # CPU-only TF — saves memory on Render free tier
+                          # Change to tensorflow>=2.15.0 if you have GPU
+
+# ─── NIfTI / Medical Imaging ─────────────────
+nibabel>=5.2.0            # Read/write .nii and .nii.gz files
+scipy>=1.12.0             # Volume resizing (zoom) for segmentation input
+
+# ─── Image / Array Utils ─────────────────────
+numpy>=1.26.0
+Pillow>=10.2.0
+opencv-python-headless>=4.9.0
+
+# ─── Misc ─────────────────────────────────────
+imageio>=2.34.0
