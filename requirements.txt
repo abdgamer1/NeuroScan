@@ -12,7 +12,7 @@ tensorflow-cpu==2.12.0    # CPU-only TF — saves memory on Render free tier
 
 # ─── NIfTI / Medical Imaging ─────────────────
 nibabel>=5.2.0            # Read/write .nii and .nii.gz files
-scipy>=1.12.0             # Volume resizing (zoom) for segmentation input
+scipy>=1.10.1             # Volume resizing (zoom) for segmentation input
 
 # ─── Image / Array Utils ─────────────────────
 numpy>=1.26.0
