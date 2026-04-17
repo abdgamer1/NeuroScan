@@ -3,7 +3,7 @@ import io
 import base64
 import tempfile
 import numpy as np
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, render_template_string
 
 import nibabel as nib
 from PIL import Image
@@ -64,7 +64,6 @@ except Exception as e:
 # NIFTI HELPERS
 # ─────────────────────────────────────────────
 def load_nifti_volume(file_storage) -> np.ndarray:
-    """Save uploaded file to temp, load with nibabel, return numpy array."""
     with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp:
         file_storage.save(tmp.name)
         tmp_path = tmp.name
@@ -73,25 +72,21 @@ def load_nifti_volume(file_storage) -> np.ndarray:
     return vol.astype(np.float32)
 
 def normalize_volume(vol: np.ndarray) -> np.ndarray:
-    """Min-max normalize to [0, 1]."""
     vmin, vmax = vol.min(), vol.max()
     if vmax - vmin < 1e-8:
         return np.zeros_like(vol)
     return (vol - vmin) / (vmax - vmin)
 
 def get_middle_slice(vol: np.ndarray) -> np.ndarray:
-    """Return the axial middle slice (H x W)."""
     z = vol.shape[2] // 2
     return vol[:, :, z]
 
 def slice_to_rgb(slice_2d: np.ndarray) -> np.ndarray:
-    """Convert a normalised 2-D float slice → uint8 RGB (H, W, 3)."""
     s = np.clip(slice_2d, 0, 1)
     uint8 = (s * 255).astype(np.uint8)
     return np.stack([uint8, uint8, uint8], axis=-1)
 
 def volume_to_nifti_bytes(vol: np.ndarray) -> bytes:
-    """Return a NIfTI file as bytes (no affine needed for mask)."""
     nii = nib.Nifti1Image(vol, affine=np.eye(4))
     buf = io.BytesIO()
     nii.to_file_map({"header": nib.FileHolder(fileobj=buf),
@@ -99,18 +94,28 @@ def volume_to_nifti_bytes(vol: np.ndarray) -> bytes:
     return buf.getvalue()
 
 def mask_preview_base64(mask_vol: np.ndarray) -> str:
-    """Middle axial slice of binary mask → base64 PNG."""
     sl = get_middle_slice(mask_vol)
     rgba = np.zeros((*sl.shape, 4), dtype=np.uint8)
-    rgba[sl > 0.5] = [255, 0, 0, 180]   # red overlay for tumor
+    rgba[sl > 0.5] = [255, 0, 0, 180]
     img = Image.fromarray(rgba, mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def slice_preview_base64(vol: np.ndarray) -> str:
+    """Middle axial slice of any volume → base64 PNG (grayscale)."""
+    norm = normalize_volume(vol)
+    sl = get_middle_slice(norm)
+    rgb = slice_to_rgb(sl)
+    img = Image.fromarray(rgb, mode="RGB")
+    img = img.resize((256, 256), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 # ─────────────────────────────────────────────
-# PREPROCESSING FOR EACH MODEL
+# PREPROCESSING
 # ─────────────────────────────────────────────
 clf_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -120,42 +125,27 @@ clf_transform = transforms.Compose([
 ])
 
 def prepare_clf_input(flair: np.ndarray, t1ce: np.ndarray) -> torch.Tensor:
-    """
-    Stack middle slices of FLAIR + T1CE into a 3-channel RGB-like image
-    for the EfficientNet classifier.
-    """
     flair_n = normalize_volume(flair)
     t1ce_n  = normalize_volume(t1ce)
-
-    flair_sl = get_middle_slice(flair_n)   # H x W
-    t1ce_sl  = get_middle_slice(t1ce_n)    # H x W
-    avg_sl   = (flair_sl + t1ce_sl) / 2.0  # average as 3rd channel
-
-    rgb = np.stack([flair_sl, t1ce_sl, avg_sl], axis=-1)  # H x W x 3
+    flair_sl = get_middle_slice(flair_n)
+    t1ce_sl  = get_middle_slice(t1ce_n)
+    avg_sl   = (flair_sl + t1ce_sl) / 2.0
+    rgb = np.stack([flair_sl, t1ce_sl, avg_sl], axis=-1)
     rgb = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-
     pil_img = Image.fromarray(rgb, mode="RGB")
-    tensor  = clf_transform(pil_img).unsqueeze(0).to(DEVICE)  # 1 x 3 x 224 x 224
+    tensor  = clf_transform(pil_img).unsqueeze(0).to(DEVICE)
     return tensor
 
 def prepare_seg_input(flair: np.ndarray, t1ce: np.ndarray,
                       target_shape=(128, 128, 128)) -> np.ndarray:
-    """
-    Resize FLAIR + T1CE volumes to a fixed shape, stack as 2-channel input.
-    Returns array of shape (1, D, H, W, 2) for the Keras model.
-    Adjust channel/shape ordering below to match how YOUR model was trained.
-    """
     from scipy.ndimage import zoom
-
     def resize_vol(vol, target):
         factors = [t / s for t, s in zip(target, vol.shape)]
         return zoom(vol, factors, order=1)
-
     flair_r = resize_vol(normalize_volume(flair), target_shape)
     t1ce_r  = resize_vol(normalize_volume(t1ce),  target_shape)
-
-    combined = np.stack([flair_r, t1ce_r], axis=-1)  # D x H x W x 2
-    return combined[np.newaxis, ...]                  # 1 x D x H x W x 2
+    combined = np.stack([flair_r, t1ce_r], axis=-1)
+    return combined[np.newaxis, ...]
 
 
 # ─────────────────────────────────────────────
@@ -177,28 +167,631 @@ def run_classification(flair: np.ndarray, t1ce: np.ndarray) -> dict:
     }
 
 def run_segmentation(flair: np.ndarray, t1ce: np.ndarray) -> dict:
-    inp        = prepare_seg_input(flair, t1ce)           # 1 x D x H x W x 2
-    pred       = seg_model.predict(inp, verbose=0)        # 1 x D x H x W x 1  (or similar)
-    mask_vol   = (pred[0, ..., 0] > 0.5).astype(np.float32)  # D x H x W binary
-
-    # Stats
+    inp        = prepare_seg_input(flair, t1ce)
+    pred       = seg_model.predict(inp, verbose=0)
+    mask_vol   = (pred[0, ..., 0] > 0.5).astype(np.float32)
     voxel_count = int(mask_vol.sum())
     total_vox   = int(mask_vol.size)
-
-    # NIfTI bytes (base64 so it travels over JSON)
     nii_bytes   = volume_to_nifti_bytes(mask_vol)
     nii_b64     = base64.b64encode(nii_bytes).decode("utf-8")
-
-    # 2-D preview PNG (base64)
     preview_b64 = mask_preview_base64(mask_vol)
-
     return {
         "tumor_voxel_count":  voxel_count,
         "total_voxels":       total_vox,
         "tumor_volume_pct":   round(100.0 * voxel_count / total_vox, 4),
-        "mask_nifti_b64":     nii_b64,       # decode & save as .nii.gz client-side
-        "mask_preview_png_b64": preview_b64, # data:image/png;base64,<this>
+        "mask_nifti_b64":     nii_b64,
+        "mask_preview_png_b64": preview_b64,
     }
+
+
+# ─────────────────────────────────────────────
+# HTML UI
+# ─────────────────────────────────────────────
+UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Brain Tumor Analysis</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --border: rgba(255,255,255,0.08);
+    --border2: rgba(255,255,255,0.15);
+    --text: #e8eaf6;
+    --muted: #8b90a8;
+    --accent: #7c6af7;
+    --accent2: #9d8ff8;
+    --success: #34d399;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --glioma-color: #f87171;
+    --menin-color: #818cf8;
+    --radius: 12px;
+    --radius-sm: 8px;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 2rem 1rem;
+    line-height: 1.6;
+  }
+
+  .container { max-width: 880px; margin: 0 auto; }
+
+  /* ── Header ── */
+  .header { text-align: center; margin-bottom: 2.5rem; }
+  .header h1 {
+    font-size: 1.75rem;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin-bottom: 0.4rem;
+    background: linear-gradient(135deg, #a78bfa, #7c6af7, #818cf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .header p { color: var(--muted); font-size: 0.9rem; }
+
+  /* ── Status pills ── */
+  .model-status {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    margin-bottom: 2rem;
+    flex-wrap: wrap;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border: 1px solid;
+  }
+  .pill.ok  { border-color: rgba(52,211,153,0.4); background: rgba(52,211,153,0.08); color: var(--success); }
+  .pill.err { border-color: rgba(248,113,113,0.4); background: rgba(248,113,113,0.08); color: var(--danger); }
+  .pill-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* ── Card ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+    margin-bottom: 1.25rem;
+  }
+  .card-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 1rem;
+  }
+
+  /* ── Upload grid ── */
+  .upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 540px) { .upload-grid { grid-template-columns: 1fr; } }
+
+  .upload-zone {
+    border: 1.5px dashed var(--border2);
+    border-radius: var(--radius-sm);
+    padding: 1.4rem 1rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    position: relative;
+  }
+  .upload-zone:hover { border-color: var(--accent); background: rgba(124,106,247,0.05); }
+  .upload-zone.has-file { border-color: var(--success); border-style: solid; }
+  .upload-zone input[type=file] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  }
+  .upload-icon { font-size: 1.6rem; margin-bottom: 0.4rem; }
+  .upload-label { font-size: 0.85rem; font-weight: 600; margin-bottom: 0.2rem; }
+  .upload-hint  { font-size: 0.75rem; color: var(--muted); }
+  .upload-name  { font-size: 0.78rem; color: var(--success); margin-top: 0.4rem; font-weight: 500; }
+
+  /* ── Mode selector ── */
+  .mode-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+  .mode-btn {
+    padding: 6px 16px;
+    border-radius: 999px;
+    border: 1px solid var(--border2);
+    background: transparent;
+    color: var(--muted);
+    font-size: 0.82rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .mode-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+
+  /* ── Submit button ── */
+  .btn-run {
+    width: 100%;
+    padding: 0.85rem;
+    border-radius: var(--radius-sm);
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .btn-run:hover { opacity: 0.88; }
+  .btn-run:active { transform: scale(0.99); }
+  .btn-run:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── Spinner ── */
+  .spinner {
+    width: 18px; height: 18px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    display: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Results ── */
+  #results { display: none; }
+
+  .result-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 580px) { .result-grid { grid-template-columns: 1fr; } }
+
+  /* Classification result */
+  .clf-result {
+    background: var(--surface2);
+    border-radius: var(--radius-sm);
+    padding: 1.2rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+  .predicted-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--muted);
+    margin-bottom: 0.2rem;
+  }
+  .predicted-class {
+    font-size: 1.5rem;
+    font-weight: 700;
+    text-transform: capitalize;
+  }
+  .predicted-class.glioma    { color: var(--glioma-color); }
+  .predicted-class.meningioma { color: var(--menin-color); }
+
+  .confidence-bar-wrap { margin-top: 0.2rem; }
+  .confidence-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .bar-track {
+    height: 6px;
+    background: var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: var(--accent);
+    transition: width 0.6s ease;
+  }
+
+  .prob-row {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .prob-item { display: flex; flex-direction: column; gap: 4px; }
+  .prob-item-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.78rem;
+  }
+  .prob-item-label span:first-child { color: var(--muted); text-transform: capitalize; }
+  .prob-item-label span:last-child  { font-weight: 600; }
+
+  /* Segmentation result */
+  .seg-result {
+    background: var(--surface2);
+    border-radius: var(--radius-sm);
+    padding: 1.2rem;
+  }
+  .seg-preview {
+    width: 100%;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    margin-bottom: 1rem;
+    image-rendering: pixelated;
+    display: block;
+  }
+  .seg-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .stat-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.82rem;
+  }
+  .stat-row span:first-child { color: var(--muted); }
+  .stat-row span:last-child  { font-weight: 600; }
+
+  .download-btn {
+    width: 100%;
+    margin-top: 1rem;
+    padding: 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border2);
+    background: transparent;
+    color: var(--text);
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .download-btn:hover { background: var(--surface); }
+
+  /* ── Error box ── */
+  .error-box {
+    background: rgba(248,113,113,0.08);
+    border: 1px solid rgba(248,113,113,0.25);
+    border-radius: var(--radius-sm);
+    padding: 1rem 1.2rem;
+    color: var(--danger);
+    font-size: 0.85rem;
+    display: none;
+  }
+
+  /* ── Section divider ── */
+  .section-label {
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ── Input slice previews ── */
+  .slice-preview-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 0.75rem;
+  }
+  .slice-preview-item { text-align: center; }
+  .slice-preview-item img {
+    width: 100%;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    display: block;
+  }
+  .slice-preview-item p {
+    font-size: 0.72rem;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="header">
+    <h1>Brain Tumor Analysis</h1>
+    <p>Upload NIfTI MRI volumes for AI-powered classification and segmentation</p>
+  </div>
+
+  <!-- Model status pills -->
+  <div class="model-status">
+    <div class="pill {{ 'ok' if clf_ready else 'err' }}">
+      <span class="pill-dot"></span>
+      Classification model {{ '(ready)' if clf_ready else '(not loaded)' }}
+    </div>
+    <div class="pill {{ 'ok' if seg_ready else 'err' }}">
+      <span class="pill-dot"></span>
+      Segmentation model {{ '(ready)' if seg_ready else '(not loaded)' }}
+    </div>
+  </div>
+
+  <!-- Upload card -->
+  <div class="card">
+    <div class="card-title">Input volumes</div>
+    <div class="upload-grid">
+      <!-- FLAIR -->
+      <div class="upload-zone" id="flair-zone">
+        <input type="file" id="flair-input" accept=".nii,.nii.gz" onchange="onFileChange('flair')"/>
+        <div class="upload-icon">🧠</div>
+        <div class="upload-label">FLAIR</div>
+        <div class="upload-hint">.nii or .nii.gz</div>
+        <div class="upload-name" id="flair-name"></div>
+      </div>
+      <!-- T1CE -->
+      <div class="upload-zone" id="t1ce-zone">
+        <input type="file" id="t1ce-input" accept=".nii,.nii.gz" onchange="onFileChange('t1ce')"/>
+        <div class="upload-icon">💡</div>
+        <div class="upload-label">T1CE</div>
+        <div class="upload-hint">.nii or .nii.gz</div>
+        <div class="upload-name" id="t1ce-name"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Analysis mode card -->
+  <div class="card">
+    <div class="card-title">Analysis mode</div>
+    <div class="mode-row">
+      <button class="mode-btn active" id="mode-both"    onclick="setMode('both')">Classification + Segmentation</button>
+      <button class="mode-btn"        id="mode-classify" onclick="setMode('classify')">Classification only</button>
+      <button class="mode-btn"        id="mode-segment"  onclick="setMode('segment')">Segmentation only</button>
+    </div>
+    <button class="btn-run" id="run-btn" onclick="runAnalysis()" disabled>
+      <div class="spinner" id="spinner"></div>
+      <span id="run-label">Analyse</span>
+    </button>
+  </div>
+
+  <!-- Error -->
+  <div class="error-box" id="error-box"></div>
+
+  <!-- Results -->
+  <div id="results">
+    <div class="section-label">Results</div>
+
+    <!-- Input slice previews -->
+    <div id="input-previews" style="display:none;" class="card">
+      <div class="card-title">Input slices (axial middle)</div>
+      <div class="slice-preview-grid">
+        <div class="slice-preview-item">
+          <img id="flair-preview-img" src="" alt="FLAIR slice"/>
+          <p>FLAIR</p>
+        </div>
+        <div class="slice-preview-item">
+          <img id="t1ce-preview-img" src="" alt="T1CE slice"/>
+          <p>T1CE</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="result-grid" id="result-grid"></div>
+  </div>
+
+</div>
+
+<script>
+  let currentMode = 'both';
+  let maskNiftiB64 = null;
+
+  function setMode(mode) {
+    currentMode = mode;
+    ['both','classify','segment'].forEach(m => {
+      document.getElementById('mode-' + m).classList.toggle('active', m === mode);
+    });
+  }
+
+  function onFileChange(field) {
+    const input = document.getElementById(field + '-input');
+    const zone  = document.getElementById(field + '-zone');
+    const name  = document.getElementById(field + '-name');
+    if (input.files.length > 0) {
+      name.textContent = input.files[0].name;
+      zone.classList.add('has-file');
+    } else {
+      name.textContent = '';
+      zone.classList.remove('has-file');
+    }
+    checkReady();
+  }
+
+  function checkReady() {
+    const flair = document.getElementById('flair-input').files.length > 0;
+    const t1ce  = document.getElementById('t1ce-input').files.length > 0;
+    document.getElementById('run-btn').disabled = !(flair && t1ce);
+  }
+
+  function setLoading(loading) {
+    const btn     = document.getElementById('run-btn');
+    const spinner = document.getElementById('spinner');
+    const label   = document.getElementById('run-label');
+    btn.disabled       = loading;
+    spinner.style.display = loading ? 'block' : 'none';
+    label.textContent  = loading ? 'Analysing…' : 'Analyse';
+  }
+
+  function showError(msg) {
+    const box = document.getElementById('error-box');
+    box.textContent = msg;
+    box.style.display = 'block';
+  }
+  function hideError() {
+    document.getElementById('error-box').style.display = 'none';
+  }
+
+  function pct(v) { return (v * 100).toFixed(1) + '%'; }
+
+  function buildClassificationCard(data) {
+    const cls = data.predicted_class;
+    const conf = data.confidence;
+    const probs = data.probabilities;
+    return `
+      <div class="clf-result">
+        <div>
+          <div class="predicted-label">Predicted tumor type</div>
+          <div class="predicted-class ${cls}">${cls}</div>
+        </div>
+        <div class="confidence-bar-wrap">
+          <div class="confidence-label">
+            <span>Confidence</span><span>${pct(conf)}</span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width:${pct(conf)};"></div>
+          </div>
+        </div>
+        <div class="prob-row">
+          <div class="prob-item">
+            <div class="prob-item-label">
+              <span>Glioma</span><span style="color:var(--glioma-color)">${pct(probs.glioma)}</span>
+            </div>
+            <div class="bar-track">
+              <div class="bar-fill" style="width:${pct(probs.glioma)};background:var(--glioma-color);"></div>
+            </div>
+          </div>
+          <div class="prob-item">
+            <div class="prob-item-label">
+              <span>Meningioma</span><span style="color:var(--menin-color)">${pct(probs.meningioma)}</span>
+            </div>
+            <div class="bar-track">
+              <div class="bar-fill" style="width:${pct(probs.meningioma)};background:var(--menin-color);"></div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function buildSegmentationCard(data) {
+    maskNiftiB64 = data.mask_nifti_b64;
+    const preview = data.mask_preview_png_b64;
+    return `
+      <div class="seg-result">
+        <img class="seg-preview" src="data:image/png;base64,${preview}" alt="Segmentation mask"/>
+        <div class="seg-stats">
+          <div class="stat-row">
+            <span>Tumor voxels</span>
+            <span>${data.tumor_voxel_count.toLocaleString()}</span>
+          </div>
+          <div class="stat-row">
+            <span>Total voxels</span>
+            <span>${data.total_voxels.toLocaleString()}</span>
+          </div>
+          <div class="stat-row">
+            <span>Tumor volume</span>
+            <span>${data.tumor_volume_pct}%</span>
+          </div>
+        </div>
+        <button class="download-btn" onclick="downloadMask()">⬇ Download mask (.nii.gz)</button>
+      </div>`;
+  }
+
+  function downloadMask() {
+    if (!maskNiftiB64) return;
+    const bytes = atob(maskNiftiB64);
+    const arr = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    const blob = new Blob([arr], { type: 'application/octet-stream' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = 'tumor_mask.nii.gz'; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function runAnalysis() {
+    hideError();
+    setLoading(true);
+    document.getElementById('results').style.display = 'none';
+    document.getElementById('result-grid').innerHTML = '';
+    maskNiftiB64 = null;
+
+    const flair = document.getElementById('flair-input').files[0];
+    const t1ce  = document.getElementById('t1ce-input').files[0];
+
+    const endpointMap = {
+      both:     '/predict',
+      classify: '/predict/classify',
+      segment:  '/predict/segment',
+    };
+
+    const fd = new FormData();
+    fd.append('flair', flair);
+    fd.append('t1ce',  t1ce);
+
+    try {
+      const resp = await fetch(endpointMap[currentMode], { method: 'POST', body: fd });
+      const data = await resp.json();
+
+      if (!resp.ok) {
+        showError(data.error || 'Server error: ' + resp.status);
+        setLoading(false);
+        return;
+      }
+
+      // Build result cards
+      const grid = document.getElementById('result-grid');
+      let html = '';
+
+      if (currentMode === 'both') {
+        if (data.classification && !data.classification.error)
+          html += `<div>${buildClassificationCard(data.classification)}</div>`;
+        else if (data.classification?.error)
+          html += `<div style="color:var(--danger);font-size:.85rem;padding:1rem;">${data.classification.error}</div>`;
+
+        if (data.segmentation && !data.segmentation.error)
+          html += `<div>${buildSegmentationCard(data.segmentation)}</div>`;
+        else if (data.segmentation?.error)
+          html += `<div style="color:var(--danger);font-size:.85rem;padding:1rem;">${data.segmentation.error}</div>`;
+      } else if (currentMode === 'classify') {
+        if (!data.error) html += `<div>${buildClassificationCard(data)}</div>`;
+        else showError(data.error);
+      } else if (currentMode === 'segment') {
+        if (!data.error) html += `<div>${buildSegmentationCard(data)}</div>`;
+        else showError(data.error);
+      }
+
+      grid.innerHTML = html;
+      document.getElementById('results').style.display = 'block';
+      document.getElementById('input-previews').style.display = 'none';
+
+    } catch (err) {
+      showError('Network error: ' + err.message);
+    }
+
+    setLoading(false);
+  }
+</script>
+</body>
+</html>
+"""
 
 
 # ─────────────────────────────────────────────
@@ -206,20 +799,11 @@ def run_segmentation(flair: np.ndarray, t1ce: np.ndarray) -> dict:
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({
-        "service":   "Brain Tumor Classification & Segmentation API",
-        "models": {
-            "classification": "classification.pth  (PyTorch EfficientNet-B0)",
-            "segmentation":   "finetuned_meningioma_model.h5  (TF/Keras 3-D U-Net)"
-        },
-        "endpoints": {
-            "POST /predict":             "Classification + Segmentation (combined)",
-            "POST /predict/classify":    "Classification only",
-            "POST /predict/segment":     "Segmentation only",
-            "GET  /health":              "Health check"
-        },
-        "input": "Multipart form-data with fields: 'flair' (.nii or .nii.gz) and 't1ce' (.nii or .nii.gz)"
-    })
+    return render_template_string(
+        UI_HTML,
+        clf_ready=clf_model is not None,
+        seg_ready=seg_model is not None,
+    )
 
 
 @app.route("/health", methods=["GET"])
@@ -232,7 +816,6 @@ def health():
 
 
 def get_nifti_inputs():
-    """Parse flair + t1ce from request files. Raises ValueError on missing."""
     if "flair" not in request.files or "t1ce" not in request.files:
         raise ValueError("Both 'flair' and 't1ce' NIfTI files are required.")
     flair = load_nifti_volume(request.files["flair"])
@@ -242,7 +825,6 @@ def get_nifti_inputs():
 
 @app.route("/predict", methods=["POST"])
 def predict_both():
-    """Run classification AND segmentation, return combined JSON."""
     try:
         flair, t1ce = get_nifti_inputs()
     except ValueError as e:
@@ -271,7 +853,6 @@ def predict_both():
 
 @app.route("/predict/classify", methods=["POST"])
 def predict_classify():
-    """Classification only."""
     if not clf_model:
         return jsonify({"error": "Classification model not loaded"}), 503
     try:
@@ -285,7 +866,6 @@ def predict_classify():
 
 @app.route("/predict/segment", methods=["POST"])
 def predict_segment():
-    """Segmentation only."""
     if not seg_model:
         return jsonify({"error": "Segmentation model not loaded"}), 503
     try:
